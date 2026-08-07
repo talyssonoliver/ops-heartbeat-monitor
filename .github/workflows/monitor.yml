@@ -1,0 +1,65 @@
+name: Dead-man monitor
+
+# External dead-man monitor for the Windows automation host and its scheduled
+# tasks. The host pushes heartbeats to a secret gist; this workflow (running on
+# GitHub's infrastructure, OUTSIDE the monitored machine, free on a public
+# repo) fails when a heartbeat goes stale — and a failed scheduled run emails
+# the owner. A powered-off machine, a dead task, or a semantically failing
+# endpoint all trip it.
+#
+# Thresholds:
+#   host heartbeat (10-min cadence)   → stale after 30 min
+#   outbox-drain  (15-min cadence)    → stale after 45 min, or lastResult != SUCCESS
+
+on:
+  schedule:
+    - cron: '*/30 * * * *'
+  workflow_dispatch: {}
+
+permissions: {}
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check heartbeats
+        env:
+          GIST_ID: ${{ secrets.HEARTBEAT_GIST_ID }}
+        run: |
+          set -eu
+          gist=$(curl -fsS --max-time 30 "https://api.github.com/gists/${GIST_ID}")
+          now=$(date -u +%s)
+          age_min () { # ISO timestamp -> age in whole minutes
+            ts=$(date -u -d "$1" +%s)
+            echo $(( (now - ts) / 60 ))
+          }
+
+          host_json=$(printf '%s' "$gist" | jq -r '.files["host.json"].content')
+          drain_json=$(printf '%s' "$gist" | jq -r '.files["outbox-drain.json"].content')
+
+          host_beat=$(printf '%s' "$host_json" | jq -r '.lastBeatAt // empty')
+          drain_success=$(printf '%s' "$drain_json" | jq -r '.lastSuccessAt // empty')
+          drain_result=$(printf '%s' "$drain_json" | jq -r '.lastResult // "NONE"')
+          drain_runs=$(printf '%s' "$drain_json" | jq -r '.runCount // 0')
+          drain_ok=$(printf '%s' "$drain_json" | jq -r '.successCount // 0')
+
+          fail=0
+          if [ -z "$host_beat" ]; then
+            echo "::error::HOST heartbeat has never been written"; fail=1
+          else
+            a=$(age_min "$host_beat")
+            echo "host heartbeat age: ${a} min"
+            if [ "$a" -gt 30 ]; then echo "::error::HOST heartbeat stale (${a} min > 30) — machine or heartbeat task is down"; fail=1; fi
+          fi
+
+          if [ -z "$drain_success" ]; then
+            echo "::error::outbox-drain has never succeeded"; fail=1
+          else
+            a=$(age_min "$drain_success")
+            echo "outbox-drain last success age: ${a} min (runs=${drain_runs}, successes=${drain_ok}, lastResult=${drain_result})"
+            if [ "$a" -gt 45 ]; then echo "::error::outbox-drain stale (${a} min > 45)"; fail=1; fi
+            if [ "$drain_result" != "SUCCESS" ]; then echo "::error::outbox-drain lastResult=${drain_result}"; fail=1; fi
+          fi
+
+          exit $fail
