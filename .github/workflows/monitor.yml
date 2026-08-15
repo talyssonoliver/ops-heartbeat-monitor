@@ -26,9 +26,25 @@ jobs:
       - name: Check heartbeats
         env:
           GIST_ID: ${{ secrets.HEARTBEAT_GIST_ID }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -eu
-          gist=$(curl -fsS --max-time 30 "https://api.github.com/gists/${GIST_ID}")
+          # Authenticated + retried fetch. 2026-08-15: an anonymous curl from a
+          # shared runner IP got a rate-limit 403 and the whole check exited 22,
+          # which reads exactly like a dead host. A fetch failure is a MONITOR
+          # fault and must say so, never impersonate a stale heartbeat.
+          gist=""
+          for attempt in 1 2 3; do
+            if gist=$(curl -fsS --max-time 30 -H "Authorization: Bearer ${GH_TOKEN}" "https://api.github.com/gists/${GIST_ID}"); then
+              break
+            fi
+            echo "gist fetch attempt ${attempt} failed; retrying in $((attempt * 10))s"
+            sleep $((attempt * 10))
+          done
+          if [ -z "$gist" ]; then
+            echo "::error::heartbeat gist UNREACHABLE after 3 attempts - monitor infrastructure fault, NOT a stale heartbeat"
+            exit 1
+          fi
           now=$(date -u +%s)
           age_min () { # ISO timestamp -> age in whole minutes
             ts=$(date -u -d "$1" +%s)
