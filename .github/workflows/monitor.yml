@@ -26,24 +26,30 @@ jobs:
       - name: Check heartbeats
         env:
           GIST_ID: ${{ secrets.HEARTBEAT_GIST_ID }}
-          GH_TOKEN: ${{ github.token }}
         run: |
           set -eu
-          # Authenticated + retried fetch. 2026-08-15: an anonymous curl from a
-          # shared runner IP got a rate-limit 403 and the whole check exited 22,
-          # which reads exactly like a dead host. A fetch failure is a MONITOR
-          # fault and must say so, never impersonate a stale heartbeat.
-          gist=""
-          for attempt in 1 2 3; do
-            if gist=$(curl -fsS --max-time 30 -H "Authorization: Bearer ${GH_TOKEN}" "https://api.github.com/gists/${GIST_ID}"); then
-              break
-            fi
-            echo "gist fetch attempt ${attempt} failed; retrying in $((attempt * 10))s"
-            sleep $((attempt * 10))
-          done
-          if [ -z "$gist" ]; then
-            echo "::error::heartbeat gist UNREACHABLE after 3 attempts - monitor infrastructure fault, NOT a stale heartbeat"
-            exit 1
+          # RAW CDN fetch, per file — 2026-08-15 incident: the gists API 403'd
+          # (anonymous = shared-runner-IP rate limit; GITHUB_TOKEN = installation
+          # tokens cannot read gists at all), and a fetch failure read exactly
+          # like a dead host. gist.githubusercontent.com serves the latest
+          # revision unauthenticated with no API rate limit. A fetch failure is
+          # a MONITOR fault and says so; it never impersonates a stale heartbeat.
+          fetch_raw () { # filename -> content, 3 attempts with backoff
+            f="$1"; out=""
+            for attempt in 1 2 3; do
+              if out=$(curl -fsSL --max-time 30 "https://gist.githubusercontent.com/talyssonoliver/${GIST_ID}/raw/${f}"); then
+                printf '%s' "$out"; return 0
+              fi
+              echo "raw fetch of ${f} attempt ${attempt} failed; retrying in $((attempt * 10))s" >&2
+              sleep $((attempt * 10))
+            done
+            return 1
+          }
+          if ! host_json=$(fetch_raw host.json); then
+            echo "::error::heartbeat gist raw fetch UNREACHABLE (host.json) after 3 attempts - monitor infrastructure fault, NOT a stale heartbeat"; exit 1
+          fi
+          if ! drain_json=$(fetch_raw outbox-drain.json); then
+            echo "::error::heartbeat gist raw fetch UNREACHABLE (outbox-drain.json) after 3 attempts - monitor infrastructure fault, NOT a stale heartbeat"; exit 1
           fi
           now=$(date -u +%s)
           age_min () { # ISO timestamp -> age in whole minutes
@@ -51,9 +57,7 @@ jobs:
             echo $(( (now - ts) / 60 ))
           }
 
-          host_json=$(printf '%s' "$gist" | jq -r '.files["host.json"].content')
-          drain_json=$(printf '%s' "$gist" | jq -r '.files["outbox-drain.json"].content')
-
+          
           host_beat=$(printf '%s' "$host_json" | jq -r '.lastBeatAt // empty')
           drain_success=$(printf '%s' "$drain_json" | jq -r '.lastSuccessAt // empty')
           drain_result=$(printf '%s' "$drain_json" | jq -r '.lastResult // "NONE"')
